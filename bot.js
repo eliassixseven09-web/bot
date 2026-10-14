@@ -10,28 +10,34 @@ const {
 const express = require("express");
 const crypto = require("crypto");
 
+// ─── Config from environment ───
 const BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
 const WEBHOOK_URL = process.env.WEBHOOK_URL || "";
 const PORT = process.env.PORT || 3000;
 const PREFIX = "!";
 
-// Shared secret between the Roblox script and this bot.
-// Set the SAME value in both. Pick something long & random.
-const API_KEY = process.env.API_KEY || "CHANGE_ME_TO_A_LONG_RANDOM_STRING";
+// ─── 🔑 THE API KEY ───
+// Set this via Railway/Replit env var called API_KEY.
+// Fallback below is used if env var is missing (change it if you want).
+const API_KEY = process.env.API_KEY || "36b3e842-f611-4c3e-b131-3d60811f8fe2";
 
+// Optional: set GUILD_ID for instant slash command registration
 const GUILD_ID = process.env.GUILD_ID || "";
 
 if (!BOT_TOKEN) {
     console.error("Missing DISCORD_BOT_TOKEN");
     process.exit(1);
 }
+if (API_KEY === "36b3e842-f611-4c3e-b131-3d60811f8fe2") {
+    console.warn("[WARN] API_KEY is still the default — change it!");
+}
 
 // ─── In-memory stores ───
-const pendingVerifications = new Map(); // discordId -> { arbixUserId, code, token, expiresAt, discordTag }
+const pendingVerifications = new Map(); // discordId -> { arbixUserId, code, token, expiresAt }
 const pendingAvatarUploads = new Map();  // discordId -> expiresAt
 const userAvatars = new Map();           // arbixUserId -> avatarURL
 const verifiedUsers = new Map();         // arbixUserId -> { discordId, discordTag, verifiedAt }
-const sessions = new Map();              // token -> { arbixUserId, discordId, createdAt }
+const sessions = new Map();              // token -> { arbixUserId, discordId, createdAt, preVerified }
 
 const AVATAR_PROMPT_TTL = 5 * 60 * 1000;
 const VERIFY_TTL        = 10 * 60 * 1000;
@@ -77,14 +83,23 @@ client.once(Events.ClientReady, async (c) => {
         } else {
             await rest.put(Routes.applicationCommands(c.user.id), { body: commands });
         }
-        // Note: global slash commands take up to ~1h to propagate.
         console.log("[Bot] Slash commands registered");
     } catch (e) {
         console.error("Register error:", e);
     }
 });
 
-// ─── Embeds ───
+// ─── Helpers ───
+function generateCode() {
+    const chars = "ABCDEFGHIJKLMNPQRSTUVWXYZ23456789";
+    let out = "";
+    for (let i = 0; i < 6; i++) out += chars[Math.floor(Math.random() * chars.length)];
+    return out;
+}
+function generateToken() {
+    return crypto.randomBytes(24).toString("hex");
+}
+
 function buildHelpEmbed() {
     return new EmbedBuilder()
         .setTitle("📖 Arbix Bot — How to use")
@@ -135,17 +150,6 @@ function buildPostVerifyEmbed(arbixUserId) {
         .setColor(0x57F287)
         .setFooter({ text: "Arbix Hub — Verified" })
         .setTimestamp();
-}
-
-// ─── Generate helpers ───
-function generateCode() {
-    const chars = "ABCDEFGHIJKLMNPQRSTUVWXYZ23456789";
-    let out = "";
-    for (let i = 0; i < 6; i++) out += chars[Math.floor(Math.random() * chars.length)];
-    return out;
-}
-function generateToken() {
-    return crypto.randomBytes(24).toString("hex");
 }
 
 // ─── Verification DM ───
@@ -205,7 +209,7 @@ async function openVerificationDM(discordId, arbixUserId) {
     return { code, token };
 }
 
-// ─── Lookups ───
+// ─── Lookup helpers ───
 function findArbixByDiscord(discordId) {
     for (const [arbixId, data] of verifiedUsers.entries()) {
         if (data.discordId === discordId) return arbixId;
@@ -213,7 +217,7 @@ function findArbixByDiscord(discordId) {
     return null;
 }
 
-// ─── Slash commands ───
+// ─── Slash command handler ───
 client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.isChatInputCommand()) {
 
@@ -286,7 +290,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
     }
 
-    // ─── Buttons ───
+    // ─── Button handler ───
     if (interaction.isButton()) {
         const parts = interaction.customId.split(":");
         const action = parts[0];
@@ -309,7 +313,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 verifiedAt: Date.now(),
             });
 
-            // Session token so the script can poll
             sessions.set(token, {
                 arbixUserId,
                 discordId: interaction.user.id,
@@ -377,11 +380,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 });
 
-// ─── Prefix commands ───
+// ─── Prefix command handler ───
 client.on(Events.MessageCreate, async (message) => {
     if (message.author.bot) return;
 
-    // Pending avatar upload prompt?
+    // Pending avatar prompt?
     const promptExpiry = pendingAvatarUploads.get(message.author.id);
     const wasWaitingForAvatar = promptExpiry && promptExpiry > Date.now();
     if (promptExpiry && promptExpiry <= Date.now()) pendingAvatarUploads.delete(message.author.id);
@@ -423,7 +426,6 @@ client.on(Events.MessageCreate, async (message) => {
         return message.reply({ embeds: [buildHelpEmbed()] });
     }
 
-    // !verify is intentionally NOT supported. Only the script can start it.
     if (cmd === "verify") {
         return message.reply(
             "✕ Verification can only be started from inside ArbixOS.\n" +
@@ -524,11 +526,13 @@ client.on(Events.MessageCreate, async (message) => {
     }
 });
 
-// ─── HTTP API ───
+// ═══════════════════════════════════════════════════════════
+// HTTP API (used by the Roblox script)
+// ═══════════════════════════════════════════════════════════
 const app = express();
 app.use(express.json());
 
-// Every route requires the shared API key from the Roblox script.
+// 🔒 Every route except /health requires the API key
 app.use((req, res, next) => {
     if (req.path === "/health") return next();
     const key = req.headers["x-api-key"];
@@ -538,9 +542,7 @@ app.use((req, res, next) => {
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-// Roblox → bot: start a verification DM.
-// Body: { discordId, arbixUserId, arbixUsername? }
-// Returns: { ok: true, token, code }  — token is what the script polls with.
+// Roblox → bot: start a verification DM
 app.post("/verify/request", async (req, res) => {
     const { discordId, arbixUserId, arbixUsername } = req.body || {};
     if (!discordId || !arbixUserId) {
@@ -549,11 +551,9 @@ app.post("/verify/request", async (req, res) => {
     if (!/^\d{15,25}$/.test(String(discordId))) {
         return res.status(400).json({ error: "discordId must be a numeric Discord user ID" });
     }
-    // If already verified for this arbixUserId → short-circuit
     if (verifiedUsers.has(arbixUserId)) {
         const v = verifiedUsers.get(arbixUserId);
         if (String(v.discordId) === String(discordId)) {
-            // Same link — return an already-verified token so script succeeds immediately
             const token = generateToken();
             sessions.set(token, {
                 arbixUserId, discordId, createdAt: Date.now(), preVerified: true,
@@ -573,9 +573,7 @@ app.post("/verify/request", async (req, res) => {
     }
 });
 
-// Roblox → bot: poll verification status using the session token.
-// Body: { token }
-// Returns: { status: "pending" | "verified" | "expired" | "invalid", discordId?, discordTag?, avatar? }
+// Roblox → bot: poll verification status via session token
 app.post("/verify/status", (req, res) => {
     const { token } = req.body || {};
     if (!token) return res.status(400).json({ error: "token required" });
@@ -583,23 +581,19 @@ app.post("/verify/status", (req, res) => {
     const sess = sessions.get(token);
     if (!sess) return res.json({ status: "invalid" });
 
-    // Pre-verified (was already linked)
     if (sess.preVerified) {
         const avatar = userAvatars.get(sess.arbixUserId) || null;
         return res.json({ status: "verified", discordId: sess.discordId, discordTag: sess.discordId, avatar });
     }
 
-    // Still waiting?
     const v = verifiedUsers.get(sess.arbixUserId);
     if (!v) {
-        // Check if pending DM still active (not expired)
         const pendingStillThere = [...pendingVerifications.values()].some(
             p => p.token === token && p.expiresAt > Date.now()
         );
         return res.json({ status: pendingStillThere ? "pending" : "expired" });
     }
 
-    // Verified!
     const avatar = userAvatars.get(sess.arbixUserId) || null;
     res.json({
         status: "verified",
@@ -609,7 +603,7 @@ app.post("/verify/status", (req, res) => {
     });
 });
 
-// Roblox → bot: get avatar for any arbixUserId
+// Roblox → bot: get avatar by arbixUserId
 app.post("/avatar/get", (req, res) => {
     const { arbixUserId } = req.body || {};
     if (!arbixUserId) return res.status(400).json({ error: "arbixUserId required" });
