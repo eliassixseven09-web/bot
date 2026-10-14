@@ -72,7 +72,7 @@ client.once(Events.ClientReady, async (c) => {
 
     const rest = new REST({ version: "10" }).setToken(BOT_TOKEN);
     try {
-        await rest.put(Routes.applicationCommands(c.user.id), { body: commands });
+        await rest.put(Routes.applicationGuildCommands(c.user.id, "1535648815648870410"), { body: commands });
         console.log("[Bot] Slash commands registered");
     } catch (e) {
         console.error("Register error:", e);
