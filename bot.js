@@ -22,7 +22,7 @@ const PREFIX = "!";
 
 // ─── 🔑 THE API KEY ───
 // Set via Railway/Replit env var called API_KEY.
-const API_KEY = process.env.API_KEY || "CHANGE_ME_TO_A_LONG_RANDOM_STRING";
+const API_KEY = process.env.API_KEY || "36b3e842-f611-4c3e-b131-3d60811f8fe2";
 
 // Optional: set GUILD_ID for instant slash command registration
 const GUILD_ID = process.env.GUILD_ID || "";
