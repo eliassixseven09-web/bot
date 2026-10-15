@@ -1,11 +1,12 @@
 // ═══════════════════════════════════════════════════════════
-// Arbix Discord Bot — v9.3
+// Arbix Discord Bot — v9.4
 //   • Script-only verification (started from ArbixOS)
 //   • DM confirmation with Verify / Not-Me buttons
+//   • /verify/check so the app can detect unverifies / force-logouts
 //   • Admin slash commands: /ban /unban /mute /unmute /role
-//   • !dm <hubuser> <message>      — Mod+ DM a linked user
-//   • !profile <hubuser>           — view an Arbix profile
-//   • !logout <hubuser>            — Mod+ force-unlink a user's Discord
+//   • !dm <hubuser> <message>    — Mod+ DM a linked user
+//   • !profile <hubuser>         — view an Arbix profile
+//   • !logout <hubuser>          — Mod+ force-unlink a user's Discord
 // ═══════════════════════════════════════════════════════════
 
 const {
@@ -122,7 +123,6 @@ client.once(Events.ClientReady, async (c) => {
     }
 });
 
-// ─── Helpers ───
 function generateCode() {
     const chars = "ABCDEFGHIJKLMNPQRSTUVWXYZ23456789";
     let out = "";
@@ -172,7 +172,6 @@ function sendDiscordWebhook(title, color, fields) {
     }).catch(() => {});
 }
 
-// ─── Embeds ───
 function buildHelpEmbed() {
     return new EmbedBuilder()
         .setTitle("📖 Arbix Bot — How to use")
@@ -189,9 +188,7 @@ function buildHelpEmbed() {
             `\`${PREFIX}dm <hubuser> <message>\` — DM a user through the bot\n` +
             `\`${PREFIX}logout <hubuser>\` — force-unlink a user's Discord\n` +
             `\`/ban\` · \`/unban\` · \`/mute\` · \`/unmute\` · \`/role\`\n\n` +
-            `Durations: \`30s\`, \`5m\`, \`2h\`, \`1d\`, or \`perm\`\n\n` +
-            `**ℹ️ Info**\n` +
-            `\`${PREFIX}help\``
+            `Durations: \`30s\`, \`5m\`, \`2h\`, \`1d\`, or \`perm\``
         )
         .setColor(0x5865F2)
         .setFooter({ text: "Arbix Hub — Bot Guide" })
@@ -245,7 +242,6 @@ async function fetchDiscordUser(discordId) {
     catch { return null; }
 }
 
-// ─── Verification DM ───
 async function openVerificationDM(discordId, arbixUserId, arbixUsername) {
     const user = await client.users.fetch(discordId);
     const code = generateCode();
@@ -291,7 +287,6 @@ async function openVerificationDM(discordId, arbixUserId, arbixUsername) {
     return { code, token };
 }
 
-// ─── Interactions ───
 client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.isChatInputCommand()) {
         const name = interaction.commandName;
@@ -320,10 +315,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             const target = interaction.options.getString("hubuser");
             const hit = findArbixByUsername(target);
             if (!hit) {
-                return interaction.reply({
-                    content: `✕ No linked account found for **${target}**.`,
-                    ephemeral: true,
-                });
+                return interaction.reply({ content: `✕ No linked account found for **${target}**.`, ephemeral: true });
             }
             const du = await fetchDiscordUser(hit.data.discordId);
             return interaction.reply({
@@ -377,10 +369,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
             const oldDiscordId = hit.data.discordId;
             verifiedUsers.delete(hit.arbixId);
             sendDiscordWebhook("🚪 Force Logout", 0xED4245, [
-                { name: "Arbix ID",  value: `\`${hit.arbixId}\``, inline: true },
-                { name: "Username",  value: `\`${hit.data.username || "?"}\``, inline: true },
-                { name: "Discord",   value: `<@${oldDiscordId}>`, inline: false },
-                { name: "By",        value: `<@${interaction.user.id}>`, inline: false },
+                { name: "Arbix ID", value: `\`${hit.arbixId}\``, inline: true },
+                { name: "Username", value: `\`${hit.data.username || "?"}\``, inline: true },
+                { name: "Discord",  value: `<@${oldDiscordId}>`, inline: false },
+                { name: "By",       value: `<@${interaction.user.id}>`, inline: false },
             ]);
             return interaction.reply({
                 content: `✅ Force-unlinked **${hit.data.username || hit.arbixId}** from <@${oldDiscordId}>. They can re-verify from ArbixOS.`,
@@ -498,7 +490,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 });
 
-// ─── Prefix commands ───
 client.on(Events.MessageCreate, async (message) => {
     if (message.author.bot) return;
     if (!message.content.startsWith(PREFIX)) return;
@@ -652,6 +643,15 @@ app.post("/verify/status", (req, res) => {
     }
 
     res.json({ status: "verified", discordId: v.discordId, discordTag: v.discordTag });
+});
+
+// Roblox → bot: check if this arbixUserId is still verified
+app.post("/verify/check", (req, res) => {
+    const { arbixUserId } = req.body || {};
+    if (!arbixUserId) return res.status(400).json({ error: "arbixUserId required" });
+    const v = verifiedUsers.get(arbixUserId);
+    if (!v) return res.json({ verified: false });
+    res.json({ verified: true, discordId: v.discordId, discordTag: v.discordTag });
 });
 
 app.listen(PORT, () => console.log(`[Bot] HTTP API running on port ${PORT}`));
