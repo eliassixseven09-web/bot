@@ -1,10 +1,11 @@
 // ═══════════════════════════════════════════════════════════
-// Arbix Discord Bot — v9.1
+// Arbix Discord Bot — v9.3
 //   • Script-only verification (started from ArbixOS)
 //   • DM confirmation with Verify / Not-Me buttons
 //   • Admin slash commands: /ban /unban /mute /unmute /role
-//   • !dm <hubuser> <message>  — Mod+ can DM a linked user
-//   • !profile <hubuser>       — Mod+ or self, shows linked account
+//   • !dm <hubuser> <message>      — Mod+ DM a linked user
+//   • !profile <hubuser>           — view an Arbix profile
+//   • !logout <hubuser>            — Mod+ force-unlink a user's Discord
 // ═══════════════════════════════════════════════════════════
 
 const {
@@ -63,6 +64,11 @@ client.once(Events.ClientReady, async (c) => {
             .setDescription("[Mod+] DM a linked Arbix user through the bot")
             .addStringOption(o => o.setName("hubuser").setDescription("Arbix username").setRequired(true))
             .addStringOption(o => o.setName("message").setDescription("Message to send").setRequired(true))
+            .toJSON(),
+        new SlashCommandBuilder()
+            .setName("logout")
+            .setDescription("[Mod+] Force-unlink a user's Discord from their Arbix account")
+            .addStringOption(o => o.setName("hubuser").setDescription("Arbix username").setRequired(true))
             .toJSON(),
         new SlashCommandBuilder()
             .setName("ban")
@@ -177,13 +183,15 @@ function buildHelpEmbed() {
             `Then press **Verify** in the DM.\n\n` +
             `**🎮 User commands**\n` +
             `\`${PREFIX}profile <hubuser>\` — view an Arbix profile\n` +
-            `\`${PREFIX}whoami\` — show your own linked account\n\n` +
+            `\`${PREFIX}whoami\` — show your own linked account\n` +
+            `\`${PREFIX}unverify\` — unlink your own Discord\n\n` +
             `**🛡️ Admin (Mod+)**\n` +
             `\`${PREFIX}dm <hubuser> <message>\` — DM a user through the bot\n` +
+            `\`${PREFIX}logout <hubuser>\` — force-unlink a user's Discord\n` +
             `\`/ban\` · \`/unban\` · \`/mute\` · \`/unmute\` · \`/role\`\n\n` +
             `Durations: \`30s\`, \`5m\`, \`2h\`, \`1d\`, or \`perm\`\n\n` +
             `**ℹ️ Info**\n` +
-            `\`${PREFIX}help\` · \`${PREFIX}unverify\``
+            `\`${PREFIX}help\``
         )
         .setColor(0x5865F2)
         .setFooter({ text: "Arbix Hub — Bot Guide" })
@@ -354,6 +362,30 @@ client.on(Events.InteractionCreate, async (interaction) => {
             } catch (e) {
                 return interaction.reply({ content: "✕ Could not DM that user (DMs closed or bot not in a shared server).", ephemeral: true });
             }
+        }
+
+        if (name === "logout") {
+            const rank = getAdminRank(interaction.user.id);
+            if (rank < ROLE_RANK.Mod) {
+                return interaction.reply({ content: "✕ Requires Mod+.", ephemeral: true });
+            }
+            const target = interaction.options.getString("hubuser");
+            const hit = findArbixByUsername(target);
+            if (!hit) {
+                return interaction.reply({ content: `✕ No linked account found for **${target}**.`, ephemeral: true });
+            }
+            const oldDiscordId = hit.data.discordId;
+            verifiedUsers.delete(hit.arbixId);
+            sendDiscordWebhook("🚪 Force Logout", 0xED4245, [
+                { name: "Arbix ID",  value: `\`${hit.arbixId}\``, inline: true },
+                { name: "Username",  value: `\`${hit.data.username || "?"}\``, inline: true },
+                { name: "Discord",   value: `<@${oldDiscordId}>`, inline: false },
+                { name: "By",        value: `<@${interaction.user.id}>`, inline: false },
+            ]);
+            return interaction.reply({
+                content: `✅ Force-unlinked **${hit.data.username || hit.arbixId}** from <@${oldDiscordId}>. They can re-verify from ArbixOS.`,
+                ephemeral: true,
+            });
         }
 
         const adminCmds = ["ban", "unban", "mute", "unmute", "role"];
@@ -530,6 +562,23 @@ client.on(Events.MessageCreate, async (message) => {
         } catch (e) {
             return message.reply("✕ Could not DM that user (DMs closed or bot not in a shared server).");
         }
+    }
+
+    if (cmd === "logout") {
+        const rank = getAdminRank(message.author.id);
+        if (rank < ROLE_RANK.Mod) return message.reply("✕ Requires Mod+.");
+        if (!rest) return message.reply(`Usage: \`${PREFIX}logout <hubuser>\``);
+        const hit = findArbixByUsername(rest);
+        if (!hit) return message.reply(`✕ No linked account found for **${rest}**.`);
+        const oldDiscordId = hit.data.discordId;
+        verifiedUsers.delete(hit.arbixId);
+        sendDiscordWebhook("🚪 Force Logout", 0xED4245, [
+            { name: "Arbix ID", value: `\`${hit.arbixId}\``, inline: true },
+            { name: "Username", value: `\`${hit.data.username || "?"}\``, inline: true },
+            { name: "Discord",  value: `<@${oldDiscordId}>`, inline: false },
+            { name: "By",       value: `<@${message.author.id}>`, inline: false },
+        ]);
+        return message.reply(`✅ Force-unlinked **${hit.data.username || hit.arbixId}** from <@${oldDiscordId}>.`);
     }
 
     if (cmd === "unverify") {
