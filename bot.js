@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════
-// Arbix Discord Bot — v1.5
-//   • No API key — open HTTP endpoints
+// Arbix Discord Bot — v9.0
+//   • No avatar / banner / bio — removed
 //   • Script-only verification (started from ArbixOS)
 //   • DM confirmation with Verify / Not-Me buttons
 //   • Admin slash commands: /ban /unban /mute /unmute /role
@@ -14,11 +14,11 @@ const {
 const express = require("express");
 const crypto = require("crypto");
 
-const BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
+const BOT_TOKEN   = process.env.DISCORD_BOT_TOKEN;
 const WEBHOOK_URL = process.env.WEBHOOK_URL || "";
-const PORT = process.env.PORT || 3000;
-const PREFIX = "!";
-const GUILD_ID = process.env.GUILD_ID || "";
+const PORT        = process.env.PORT || 3000;
+const PREFIX      = "!";
+const GUILD_ID    = process.env.GUILD_ID || "";
 
 if (!BOT_TOKEN) {
     console.error("Missing DISCORD_BOT_TOKEN");
@@ -26,17 +26,14 @@ if (!BOT_TOKEN) {
 }
 
 // ─── In-memory stores ───
-const pendingVerifications = new Map();
-const pendingAvatarUploads = new Map();
-const userAvatars          = new Map();
-const verifiedUsers        = new Map();
-const sessions             = new Map();
+const pendingVerifications = new Map(); // discordId -> { arbixUserId, code, token, expiresAt }
+const verifiedUsers        = new Map(); // arbixUserId -> { discordId, discordTag, verifiedAt }
+const sessions             = new Map(); // token -> { arbixUserId, discordId, createdAt, preVerified }
 
-const AVATAR_PROMPT_TTL = 5 * 60 * 1000;
-const VERIFY_TTL        = 10 * 60 * 1000;
+const VERIFY_TTL = 10 * 60 * 1000;
+const ROLE_RANK  = { Banned: -1, User: 0, VIP: 1, Staff: 2, Mod: 3, Admin: 4, Owner: 5 };
 
-const ROLE_RANK = { Banned: -1, User: 0, VIP: 1, Staff: 2, Mod: 3, Admin: 4, Owner: 5 };
-
+// ─── Discord client ───
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -55,11 +52,6 @@ client.once(Events.ClientReady, async (c) => {
     });
 
     const commands = [
-        new SlashCommandBuilder()
-            .setName("avatar")
-            .setDescription("Set your Arbix chat avatar (verified users only)")
-            .addStringOption(o => o.setName("url").setDescription("Direct image URL").setRequired(false))
-            .toJSON(),
         new SlashCommandBuilder()
             .setName("help")
             .setDescription("How to use the Arbix bot")
@@ -169,6 +161,7 @@ function sendDiscordWebhook(title, color, fields) {
     }).catch(() => {});
 }
 
+// ─── Embeds ───
 function buildHelpEmbed() {
     return new EmbedBuilder()
         .setTitle("📖 Arbix Bot — How to use")
@@ -177,12 +170,11 @@ function buildHelpEmbed() {
             `Started **only** from inside ArbixOS.\n` +
             `Open ArbixOS → ⚙ Settings → **Discord Verification** → enter your Discord user ID.\n` +
             `Then press **Verify** in the DM.\n\n` +
-            `**🖼️ Avatar** (after verifying)\n` +
-            `\`${PREFIX}avatar\` — attach an image\n` +
-            `\`${PREFIX}avatar <imageURL>\` — paste a direct link\n\n` +
             `**🛡️ Admin (Mod+)**\n` +
             `\`/ban\` · \`/unban\` · \`/mute\` · \`/unmute\` · \`/role\`\n\n` +
-            `Durations: \`30s\`, \`5m\`, \`2h\`, \`1d\`, or \`perm\``
+            `Durations: \`30s\`, \`5m\`, \`2h\`, \`1d\`, or \`perm\`\n\n` +
+            `**ℹ️ Info**\n` +
+            `\`${PREFIX}help\` · \`${PREFIX}whoami\` · \`${PREFIX}unverify\``
         )
         .setColor(0x5865F2)
         .setFooter({ text: "Arbix Hub — Bot Guide" })
@@ -190,24 +182,22 @@ function buildHelpEmbed() {
 }
 
 function buildPostVerifyEmbed(arbixUserId) {
-    const alreadySet = userAvatars.has(arbixUserId);
     return new EmbedBuilder()
         .setTitle("✅ Verified Successfully")
         .setDescription(
             `Your Discord is now linked to Arbix account **\`${arbixUserId}\`**.\n\n` +
             `Head back to ArbixOS — the app is already polling and will confirm shortly.\n\n` +
-            `**🎨 Set your chat avatar**\n` +
-            `• \`${PREFIX}avatar\` with an image attached\n` +
-            `• \`${PREFIX}avatar https://example.com/image.png\`\n\n` +
-            (alreadySet
-                ? `**Your current avatar is already set.** Run \`${PREFIX}avatar\` again to replace it.`
-                : `**You don't have an avatar set yet.** Run \`${PREFIX}avatar\` to add one.`)
+            `**🎮 Prefix commands**\n` +
+            `\`${PREFIX}help\` — see every command\n` +
+            `\`${PREFIX}whoami\` — show your linked account\n` +
+            `\`${PREFIX}unverify\` — unlink your Discord`
         )
         .setColor(0x57F287)
         .setFooter({ text: "Arbix Hub — Verified" })
         .setTimestamp();
 }
 
+// ─── Verification DM ───
 async function openVerificationDM(discordId, arbixUserId) {
     const user = await client.users.fetch(discordId);
     const code = generateCode();
@@ -257,35 +247,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.isChatInputCommand()) {
         const name = interaction.commandName;
 
-        if (name === "avatar") {
-            const url = interaction.options.getString("url");
-            const arbixId = findArbixByDiscord(interaction.user.id);
-            if (!arbixId) {
-                return interaction.reply({
-                    content: "✕ You need to verify first — open ArbixOS → Settings → Discord Verification.",
-                    ephemeral: true,
-                });
-            }
-            if (!url) {
-                pendingAvatarUploads.set(interaction.user.id, Date.now() + AVATAR_PROMPT_TTL);
-                return interaction.reply({ content: `🖼️ **Send the image here.**`, ephemeral: true });
-            }
-            if (!/^https?:\/\/.+/i.test(url)) {
-                return interaction.reply({ content: "✕ Invalid image URL.", ephemeral: true });
-            }
-            userAvatars.set(arbixId, url);
-            return interaction.reply({
-                embeds: [
-                    new EmbedBuilder()
-                        .setTitle("🖼️ Avatar Set")
-                        .setDescription(`Your new chat avatar is now active for **\`${arbixId}\`**.`)
-                        .setThumbnail(url)
-                        .setColor(0x57F287)
-                ],
-                ephemeral: true,
-            });
-        }
-
         if (name === "help") {
             return interaction.reply({ embeds: [buildHelpEmbed()], ephemeral: true });
         }
@@ -299,7 +260,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 });
             }
             const data = verifiedUsers.get(arbixId);
-            const avatar = userAvatars.get(arbixId);
             return interaction.reply({
                 embeds: [
                     new EmbedBuilder()
@@ -307,11 +267,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
                         .addFields(
                             { name: "Arbix ID", value: `\`${arbixId}\``, inline: true },
                             { name: "Discord", value: `<@${data.discordId}>`, inline: true },
-                            { name: "Verified", value: `<t:${Math.floor(data.verifiedAt / 1000)}:R>`, inline: false },
-                            { name: "Avatar", value: avatar ? `[Link](${avatar})` : "*not set*", inline: false }
+                            { name: "Verified", value: `<t:${Math.floor(data.verifiedAt / 1000)}:R>`, inline: false }
                         )
                         .setColor(0x5869F2)
-                        .setThumbnail(avatar || null)
                 ],
                 ephemeral: true,
             });
@@ -321,7 +279,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         if (adminCmds.includes(name)) {
             const rank = getAdminRank(interaction.user.id);
             if (rank < ROLE_RANK.Mod) {
-                return interaction.reply({ content: "✕ You don't have permission (requires Mod+).", ephemeral: true });
+                return interaction.reply({
+                    content: "✕ You don't have permission (requires Mod+).",
+                    ephemeral: true,
+                });
             }
             if (name === "role" && rank < ROLE_RANK.Owner) {
                 return interaction.reply({ content: "✕ Requires Owner.", ephemeral: true });
@@ -332,7 +293,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
             const reason   = interaction.options.getString("reason") || "No reason given";
             const newRole  = interaction.options.getString("role");
 
-            let reply = "", color = 0xED4245;
+            let reply = "";
+            let color = 0xED4245;
 
             if (name === "ban") {
                 const secs = parseDurationToSeconds(duration);
@@ -389,7 +351,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         const pending = pendingVerifications.get(interaction.user.id);
         if (!pending || pending.token !== token || pending.arbixUserId !== arbixUserId) {
-            return interaction.reply({ content: "✕ This verification has expired or is invalid.", ephemeral: true });
+            return interaction.reply({
+                content: "✕ This verification has expired or is invalid.",
+                ephemeral: true,
+            });
         }
 
         if (action === "verify_yes") {
@@ -397,6 +362,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 discordId: interaction.user.id,
                 discordTag: interaction.user.tag,
                 verifiedAt: Date.now(),
+                role: "User",
             });
             sessions.set(token, {
                 arbixUserId,
@@ -410,9 +376,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 components: [],
             });
 
-            sendDiscordWebhook("✅ User Verified", 0x57F287, [
+            sendDiscordWebhook("✅ User Verified (via ArbixOS)", 0x57F287, [
                 { name: "Arbix ID", value: `\`${arbixUserId}\``, inline: true },
                 { name: "Discord",  value: `<@${interaction.user.id}>`, inline: false },
+                { name: "Time",     value: `\`${new Date().toISOString()}\``, inline: true },
             ]);
             return;
         }
@@ -423,11 +390,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 embeds: [
                     new EmbedBuilder()
                         .setTitle("❌ Verification Declined")
-                        .setDescription("No changes were made.")
+                        .setDescription("No changes were made. You can start a new verification from ArbixOS.")
                         .setColor(0xED4245)
                 ],
                 components: [],
             });
+            sendDiscordWebhook("❌ Verification Declined", 0xED4245, [
+                { name: "Arbix ID", value: `\`${arbixUserId}\``, inline: true },
+                { name: "Discord",  value: `<@${interaction.user.id}>`, inline: false },
+            ]);
             return;
         }
     }
@@ -436,49 +407,28 @@ client.on(Events.InteractionCreate, async (interaction) => {
 // ─── Prefix commands ───
 client.on(Events.MessageCreate, async (message) => {
     if (message.author.bot) return;
-
-    const promptExpiry = pendingAvatarUploads.get(message.author.id);
-    const wasWaitingForAvatar = promptExpiry && promptExpiry > Date.now();
-    if (promptExpiry && promptExpiry <= Date.now()) pendingAvatarUploads.delete(message.author.id);
-
-    const hasImage = message.attachments.some(a =>
-        (a.contentType || "").startsWith("image/") ||
-        /\.(png|jpe?g|gif|webp)$/i.test(a.name || "")
-    );
-
-    if (wasWaitingForAvatar && hasImage && !message.content.startsWith(PREFIX)) {
-        pendingAvatarUploads.delete(message.author.id);
-        const arbixId = findArbixByDiscord(message.author.id);
-        if (!arbixId) return message.reply("✕ You need to verify first.");
-        const attachment = message.attachments.find(a =>
-            (a.contentType || "").startsWith("image/") ||
-            /\.(png|jpe?g|gif|webp)$/i.test(a.name || "")
-        );
-        if (!attachment) return message.reply("✕ No valid image found.");
-        userAvatars.set(arbixId, attachment.url);
-        return message.reply({
-            embeds: [
-                new EmbedBuilder()
-                    .setTitle("🖼️ Avatar Updated")
-                    .setDescription(`Your new avatar is now active for **\`${arbixId}\`**.`)
-                    .setThumbnail(attachment.url)
-                    .setColor(0x57F287)
-            ]
-        });
-    }
-
     if (!message.content.startsWith(PREFIX)) return;
 
     const args = message.content.slice(PREFIX.length).trim().split(/\s+/);
     const cmd = (args.shift() || "").toLowerCase();
 
-    if (cmd === "help") return message.reply({ embeds: [buildHelpEmbed()] });
+    if (cmd === "help") {
+        return message.reply({ embeds: [buildHelpEmbed()] });
+    }
+
+    if (cmd === "verify") {
+        return message.reply(
+            "✕ Verification can only be started from inside ArbixOS.\n" +
+            "Open ArbixOS → ⚙ Settings → **Discord Verification**."
+        );
+    }
 
     if (cmd === "whoami") {
         const arbixId = findArbixByDiscord(message.author.id);
-        if (!arbixId) return message.reply("You are not verified.");
+        if (!arbixId) {
+            return message.reply("You are not verified. Open ArbixOS → Settings → Discord Verification.");
+        }
         const data = verifiedUsers.get(arbixId);
-        const avatar = userAvatars.get(arbixId);
         return message.reply({
             embeds: [
                 new EmbedBuilder()
@@ -486,7 +436,7 @@ client.on(Events.MessageCreate, async (message) => {
                     .addFields(
                         { name: "Arbix ID", value: `\`${arbixId}\``, inline: true },
                         { name: "Discord", value: `<@${data.discordId}>`, inline: true },
-                        { name: "Avatar", value: avatar ? `[Link](${avatar})` : "*not set*", inline: false }
+                        { name: "Verified", value: `<t:${Math.floor(data.verifiedAt / 1000)}:R>`, inline: false }
                     )
                     .setColor(0x5869F2)
             ]
@@ -497,26 +447,27 @@ client.on(Events.MessageCreate, async (message) => {
         const arbixId = findArbixByDiscord(message.author.id);
         if (!arbixId) return message.reply("You are not verified.");
         verifiedUsers.delete(arbixId);
-        userAvatars.delete(arbixId);
         return message.reply({
             embeds: [
                 new EmbedBuilder()
                     .setTitle("🔓 Unverified")
-                    .setDescription(`Unlinked from \`${arbixId}\`.`)
+                    .setDescription(`Your Discord has been unlinked from \`${arbixId}\`.`)
                     .setColor(0xED4245)
+                    .setTimestamp()
             ]
         });
     }
 });
 
 // ═══════════════════════════════════════════════════════════
-// HTTP API — NO API KEY
+// HTTP API for the Roblox script
 // ═══════════════════════════════════════════════════════════
 const app = express();
 app.use(express.json());
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
+// Roblox → bot: start verification DM
 app.post("/verify/request", async (req, res) => {
     const { discordId, arbixUserId, arbixUsername } = req.body || {};
     if (!discordId || !arbixUserId) {
@@ -525,6 +476,7 @@ app.post("/verify/request", async (req, res) => {
     if (!/^\d{15,25}$/.test(String(discordId))) {
         return res.status(400).json({ error: "discordId must be a numeric Discord user ID" });
     }
+
     if (verifiedUsers.has(arbixUserId)) {
         const v = verifiedUsers.get(arbixUserId);
         if (String(v.discordId) === String(discordId)) {
@@ -547,6 +499,7 @@ app.post("/verify/request", async (req, res) => {
     }
 });
 
+// Roblox → bot: poll verification status
 app.post("/verify/status", (req, res) => {
     const { token } = req.body || {};
     if (!token) return res.status(400).json({ error: "token required" });
@@ -555,12 +508,10 @@ app.post("/verify/status", (req, res) => {
     if (!sess) return res.json({ status: "invalid" });
 
     if (sess.preVerified) {
-        const avatar = userAvatars.get(sess.arbixUserId) || null;
         return res.json({
             status: "verified",
             discordId: sess.discordId,
             discordTag: sess.discordId,
-            avatar,
         });
     }
 
@@ -572,19 +523,11 @@ app.post("/verify/status", (req, res) => {
         return res.json({ status: pendingStillThere ? "pending" : "expired" });
     }
 
-    const avatar = userAvatars.get(sess.arbixUserId) || null;
     res.json({
         status: "verified",
         discordId: v.discordId,
         discordTag: v.discordTag,
-        avatar,
     });
-});
-
-app.post("/avatar/get", (req, res) => {
-    const { arbixUserId } = req.body || {};
-    if (!arbixUserId) return res.status(400).json({ error: "arbixUserId required" });
-    res.json({ avatar: userAvatars.get(arbixUserId) || null });
 });
 
 app.listen(PORT, () => console.log(`[Bot] HTTP API running on port ${PORT}`));
